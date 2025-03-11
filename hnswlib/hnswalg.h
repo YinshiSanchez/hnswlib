@@ -1,5 +1,13 @@
 #pragma once
 
+#include <exception>
+#include <sys/types.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <stdio.h>
+
 #include "visited_list_pool.h"
 #include "hnswlib.h"
 #include <atomic>
@@ -13,6 +21,8 @@
 namespace hnswlib {
 typedef unsigned int tableint;
 typedef unsigned int linklistsizeint;
+
+constexpr char* DATA_FILE_NAME = "hnsw.bin";
 
 template<typename dist_t>
 class HierarchicalNSW : public AlgorithmInterface<dist_t> {
@@ -69,6 +79,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
 
     std::mutex deleted_elements_lock;  // lock for deleted_elements
     std::unordered_set<tableint> deleted_elements;  // contains internal ids of deleted elements
+    int data_fd_;
 
 
     HierarchicalNSW(SpaceInterface<dist_t> *s) {
@@ -122,8 +133,33 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         offsetData_ = size_links_level0_;
         label_offset_ = size_links_level0_ + data_size_;
         offsetLevel0_ = 0;
+        
+        // open file
+        data_fd_ = open(DATA_FILE_NAME, O_RDWR | O_CREAT, 0666);
+        if (data_fd_ == -1) {
+          perror("open");
+          std::terminate();
+        }
 
-        data_level0_memory_ = (char *) malloc(max_elements_ * size_data_per_element_);
+        // allocate storage
+        off_t file_size = max_elements_ * size_data_per_element_;
+        if (ftruncate(data_fd_, file_size) == -1) {
+          perror("ftruncate");
+          close(data_fd_);
+          std::terminate();
+        }
+
+        void *addr = mmap(NULL, file_size, PROT_READ | PROT_WRITE, MAP_SHARED, data_fd_, 0);
+        if (addr == MAP_FAILED) {
+          perror("mmap");
+          close(data_fd_);
+          std::terminate();
+        }
+
+        data_level0_memory_ = (char*) addr;
+
+
+        // data_level0_memory_ = (char *) malloc(max_elements_ * size_data_per_element_);
         if (data_level0_memory_ == nullptr)
             throw std::runtime_error("Not enough memory");
 
@@ -149,7 +185,13 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
     }
 
     void clear() {
-        free(data_level0_memory_);
+        if (munmap(data_level0_memory_, max_elements_ * size_data_per_element_) == -1) {
+          perror("munmap");
+          close(data_fd_);
+          std::terminate();
+        }
+        close(data_fd_);
+        // free(data_level0_memory_);
         data_level0_memory_ = nullptr;
         for (tableint i = 0; i < cur_element_count; i++) {
             if (element_levels_[i] > 0)
